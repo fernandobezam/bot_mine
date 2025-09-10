@@ -10,7 +10,7 @@
     "axios": "^1.6.0",
     "dotenv": "^16.0.3",
     "node-telegram-bot-api": "^0.61.0",
-    "rcon-client": "^5.0.0",
+    "rcon-client": "^4.2.5",
     "ssh2-sftp-client": "^8.0.0"
   }
 }
