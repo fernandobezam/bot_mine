@@ -1,0 +1,14 @@
+# Ignorar o arquivo de variáveis de ambiente
+.env
+
+# Ignorar node_modules (dependências instaladas localmente)
+node_modules/
+
+# Ignorar logs do servidor ou crash
+*.log
+*.txt
+crash_reports/
+
+# Ignorar arquivos temporários do sistema (Windows)
+Thumbs.db
+.DS_Store
