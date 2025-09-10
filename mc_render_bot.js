@@ -286,3 +286,15 @@ process.on("unhandledRejection", (err) => {
 process.on("uncaughtException", (err) => {
   console.error("Uncaught Exception:", err);
 });
+const http = require('http');
+
+const port = process.env.PORT || 3000;
+
+const server = http.createServer((req, res) => {
+  res.end('Bot online ✅');
+});
+
+server.listen(port, () => {
+  console.log(`Fake HTTP server running on port ${port}`);
+});
+
