@@ -1,20 +1,16 @@
 {
-  "name": "mc-render-bot",
+  "name": "mc_render_bot",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Bot para monitorar servidor Minecraft e Telegram",
+  "main": "mc_render_bot.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node mc_render_bot.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "axios": "^1.11.0",
-    "dotenv": "^17.2.2",
-    "node-telegram-bot-api": "^0.66.0",
-    "openai": "^5.20.0",
-    "rcon-client": "^4.2.5",
-    "ssh2-sftp-client": "^12.0.1"
+    "axios": "^1.6.0",
+    "dotenv": "^16.0.3",
+    "node-telegram-bot-api": "^0.61.0",
+    "rcon-client": "^5.0.0",
+    "ssh2-sftp-client": "^8.0.0"
   }
 }
