@@ -1,9 +1,9 @@
 /**
- * mc_render_bot.js (versão completa e corrigida)
+ * mc_render_bot.js (versão final para Gemini Pro)
  *
- * - Tradução robusta EN -> PT: Helsinki-NLP/opus-mt-en-pt
- * - Explicação de erros: facebook/bart-large-mnli (zero-shot-classification corrigido)
- * - Compatível com Hugging Face API gratuita
+ * - Gemini Pro para respostas no Telegram
+ * - RCON, SFTP, monitoramento de logs e crash do Minecraft
+ * - Fake HTTP server para Render Web Service
  */
 
 require("dotenv").config({ path: __dirname + "/.env" });
@@ -12,6 +12,7 @@ const SftpClient = require("ssh2-sftp-client");
 const path = require("path");
 const { Rcon } = require("rcon-client");
 const axios = require("axios");
+const http = require("http");
 
 // === Configurações do .env ===
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -25,104 +26,64 @@ const MC_CRASH_DIR = process.env.MC_CRASH_DIR;
 const RCON_HOST = process.env.RCON_HOST;
 const RCON_PORT = parseInt(process.env.RCON_PORT || "26255");
 const RCON_PASSWORD = process.env.RCON_PASSWORD;
-const HF_TOKEN = process.env.HF_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const sftp = new SftpClient();
 let rcon = null;
 
-// === Função genérica Hugging Face ===
-async function callHuggingFaceModel(model, input, parameters = {}, timeout = 20000) {
+// === Gemini Pro segura com timeout 30s e log detalhado ===
+async function askGeminiPro(question) {
+  if (!GEMINI_API_KEY) return "⚠️ Gemini Pro não configurada.";
+
   try {
     const res = await axios.post(
-      `https://api-inference.huggingface.co/models/${model}`,
-      { inputs: input, parameters },
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+      { contents: [{ parts: [{ text: question }] }] },
       {
         headers: {
-          Authorization: `Bearer ${HF_TOKEN}`,
           "Content-Type": "application/json",
+          "X-goog-api-key": GEMINI_API_KEY
         },
-        timeout,
+        timeout: 30000
       }
     );
 
-    const data = res.data;
-    if (!data) return null;
+    console.log("Resposta Gemini Pro:", JSON.stringify(res.data, null, 2));
 
-    if (typeof data === "string") return data;
-    if (Array.isArray(data) && data.length > 0) {
-      if (typeof data[0] === "string") return data[0];
-      if (data[0].generated_text) return data[0].generated_text;
-      return JSON.stringify(data[0]);
+    const candidate = res.data?.candidates?.[0];
+    let reply = "";
+
+    // Extrair corretamente o texto de content.parts
+    if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
+      reply = candidate.content.parts.map(p => p.text || "").join("\n");
+    } else if (typeof candidate?.content === "string") {
+      reply = candidate.content;
+    } else if (candidate?.output) {
+      reply = candidate.output;
     }
-    if (data.generated_text) return data.generated_text;
-    return JSON.stringify(data);
+
+    return reply || "⚠️ Sem resposta da Gemini Pro.";
   } catch (err) {
-    console.error("Erro Hugging Face:", err.response?.data || err.message);
-    return null;
+    console.error("Erro Gemini Pro:", err.message, err.response?.data || "");
+    return "⚠️ Erro ao se comunicar com Gemini Pro.";
   }
 }
-
-// === Tradução EN -> PT robusta (mantendo símbolos e emojis) ===
+// === Tradução EN -> PT via Gemini Pro ===
 async function translateToPortugueseRobust(text) {
-  if (!HF_TOKEN) return text;
-
-  const cleanText = text.replace(/[\u0000-\u001F\u007F]/g, ""); // Remove caracteres de controle
-  const model = "Helsinki-NLP/opus-mt-en-pt";
-  const result = await callHuggingFaceModel(model, cleanText);
-
-  if (!result) return text;
-
-  // Escapar HTML básico para Telegram
-  const escaped = result
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-
-  return escaped;
+  return await askGeminiPro(`Traduza para português mantendo emojis e símbolos: "${text}"`);
 }
 
-// === Explicar erro ===
-async function explainErrorWithHF(text) {
-  if (!HF_TOKEN) return `Erro: ${text}`;
-  const model = "facebook/bart-large-mnli";
-  const candidateLabels = ["Erro de servidor", "Erro de RCON", "Erro de SFTP", "Outro"];
-
-  const result = await callHuggingFaceModel(
-    model,
-    text,
-    { candidate_labels: candidateLabels, multi_label: false },
-    25000
-  );
-
-  if (result && typeof result === "string") return result;
-
-  try {
-    const parsed = typeof result === "string" ? JSON.parse(result) : result;
-    if (parsed?.labels && parsed?.scores) {
-      return `Categoria provável: ${parsed.labels[0]} (confiança: ${Math.round(parsed.scores[0] * 100)}%)`;
-    }
-    return JSON.stringify(parsed);
-  } catch {
-    return result || `Erro: ${text}`;
-  }
-}
-
+// === Explicar erro via Gemini Pro ===
 async function explainError(error) {
   const text = typeof error === "string" ? error : error?.message || String(error);
-  return await explainErrorWithHF(text);
+  return await askGeminiPro(`Explique este erro do servidor Minecraft de forma simples: "${text}"`);
 }
 
 // === Conectar RCON ===
 async function connectRcon() {
   try {
-    rcon = new Rcon({
-      host: RCON_HOST,
-      port: RCON_PORT,
-      password: RCON_PASSWORD,
-      timeout: 5000,
-    });
-
+    rcon = new Rcon({ host: RCON_HOST, port: RCON_PORT, password: RCON_PASSWORD, timeout: 5000 });
     await rcon.connect();
     console.log("✅ RCON conectado!");
     sendTelegram("🔌 Conexão RCON estabelecida!");
@@ -137,33 +98,24 @@ async function connectRcon() {
 
 // === Ping dos jogadores ===
 async function getPlayersPing() {
-  if (!rcon) {
-    await connectRcon();
-    return;
-  }
-
+  if (!rcon) await connectRcon();
   try {
     const response = await rcon.send("list");
     const match = response.match(/: (.*)$/);
     if (!match || !match[1]) return;
-
     const players = match[1].split(", ").filter(Boolean);
     for (let player of players) {
       try {
         const pingResp = await rcon.send(`ping ${player}`);
         const pingMatch = pingResp.match(/(\d+)ms/);
-        if (pingMatch) {
-          sendTelegram(`📶 <b>${player}:</b> ${pingMatch[1]}ms`);
-        }
+        if (pingMatch) sendTelegram(`📶 <b>${player}:</b> ${pingMatch[1]}ms`);
       } catch (err) {
         console.error(`Erro ao pegar ping de ${player}:`, err.message);
       }
     }
   } catch (err) {
     console.error("Erro ao listar jogadores:", err.message);
-    if (err.message.includes("connection") || err.message.includes("closed")) {
-      await connectRcon();
-    }
+    if (err.message.includes("connection") || err.message.includes("closed")) await connectRcon();
   }
 }
 
@@ -173,32 +125,28 @@ let sending = false;
 async function processTelegramQueue() {
   if (sending || telegramQueue.length === 0) return;
   sending = true;
-
   const msg = telegramQueue.shift();
-  try {
-    await bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: "HTML" });
-  } catch (err) {
-    console.error("Erro Telegram:", err.message);
-  }
-
+  try { await bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: "HTML" }); } 
+  catch (err) { console.error("Erro Telegram:", err.message); }
   sending = false;
   if (telegramQueue.length > 0) setTimeout(processTelegramQueue, 1200);
 }
+function sendTelegram(msg) { telegramQueue.push(msg); processTelegramQueue(); }
 
-function sendTelegram(msg) {
-  telegramQueue.push(msg);
-  processTelegramQueue();
-}
+// === Listener Telegram para responder perguntas via Gemini Pro ===
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text;
+  if (!text || msg.from.is_bot) return;
+  if (chatId.toString() !== TELEGRAM_CHAT_ID) return;
+  const response = await askGeminiPro(text);
+  sendTelegram(`🤖 <b>Gemini Pro:</b> ${response}`);
+});
 
 // === Monitorar arquivos via SFTP ===
 async function watchLogs() {
   try {
-    await sftp.connect({
-      host: SFTP_HOST,
-      port: SFTP_PORT,
-      username: SFTP_USER,
-      password: SFTP_PASSWORD,
-    });
+    await sftp.connect({ host: SFTP_HOST, port: SFTP_PORT, username: SFTP_USER, password: SFTP_PASSWORD });
     console.log("✅ SFTP conectado!");
     sendTelegram("🤖 Bot conectado ao servidor!");
 
@@ -208,9 +156,7 @@ async function watchLogs() {
     setInterval(async () => {
       try {
         const filesLogs = await sftp.list(MC_LOG_DIR);
-        const latestLog = filesLogs.filter(f => f.name.endsWith(".log"))
-          .sort((a, b) => b.modifyTime - a.modifyTime)[0];
-
+        const latestLog = filesLogs.filter(f => f.name.endsWith(".log")).sort((a,b)=>b.modifyTime-a.modifyTime)[0];
         if (!latestLog) return;
         const remotePath = path.posix.join(MC_LOG_DIR, latestLog.name);
         const stats = await sftp.stat(remotePath);
@@ -218,7 +164,6 @@ async function watchLogs() {
         if (stats.size > lastLogSize) {
           const content = (await sftp.get(remotePath)).toString("utf-8");
           const lines = content.split("\n").slice(-10);
-
           for (let line of lines) {
             if (line.includes("joined the game")) {
               const player = line.match(/(\w+) joined the game/);
@@ -231,36 +176,28 @@ async function watchLogs() {
               if (chatMatch) {
                 const playerName = chatMatch[1];
                 const messageOriginal = chatMatch[2];
-
-                // Traduz a mensagem robustamente
                 const translated = await translateToPortugueseRobust(messageOriginal);
-
                 sendTelegram(`💬 <b>${playerName}:</b> ${translated}`);
               }
             }
           }
           lastLogSize = stats.size;
         }
-      } catch (err) {
-        console.error("Erro SFTP Logs:", err.message);
-      }
+      } catch (err) { console.error("Erro SFTP Logs:", err.message); }
     }, 5000);
 
     setInterval(async () => {
       try {
         const filesCrash = await sftp.list(MC_CRASH_DIR);
         if (filesCrash.length === 0) return;
-
-        const latestCrash = filesCrash.sort((a, b) => b.modifyTime - a.modifyTime)[0];
+        const latestCrash = filesCrash.sort((a,b)=>b.modifyTime-a.modifyTime)[0];
         if (latestCrash.modifyTime * 1000 > lastCrashCheck) {
           const remotePath = path.posix.join(MC_CRASH_DIR, latestCrash.name);
           const content = (await sftp.get(remotePath)).toString("utf-8");
           sendTelegram(`💥 <b>Crash detectado!</b>\nArquivo: ${latestCrash.name}\n\n${content.substring(0, 500)}...`);
           lastCrashCheck = Date.now();
         }
-      } catch (err) {
-        console.error("Erro SFTP Crash Reports:", err.message);
-      }
+      } catch (err) { console.error("Erro SFTP Crash Reports:", err.message); }
     }, 10000);
 
     setInterval(getPlayersPing, 30000);
@@ -280,21 +217,10 @@ async function watchLogs() {
   console.log("mc_render_bot em execução!");
 })();
 
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled Rejection:", err);
-});
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err);
-});
-const http = require('http');
+process.on("unhandledRejection", err => console.error("Unhandled Rejection:", err));
+process.on("uncaughtException", err => console.error("Uncaught Exception:", err));
 
+// === Fake HTTP server para Render Web Service ===
 const port = process.env.PORT || 3000;
-
-const server = http.createServer((req, res) => {
-  res.end('Bot online ✅');
-});
-
-server.listen(port, () => {
-  console.log(`Fake HTTP server running on port ${port}`);
-});
-
+const server = http.createServer((req,res)=>res.end("Bot online ✅"));
+server.listen(port, ()=>console.log(`Fake HTTP server running on port ${port}`));
