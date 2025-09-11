@@ -1,17 +1,24 @@
 {
-  "name": "mc_render_bot",
+  "name": "mc-render-bot",
   "version": "1.0.0",
-  "description": "Bot para monitorar servidor Minecraft e Telegram",
+  "description": "Bot completo de monitoramento e backup para Minecraft com RCON, Telegram e KubeJS",
   "main": "mc_render_bot.js",
   "scripts": {
     "start": "node mc_render_bot.js"
   },
+  "author": "Fernando Bezam",
+  "license": "MIT",
   "dependencies": {
-    "axios": "^1.11.0",
-    "dotenv": "^16.0.3",
+    "@google/generative-ai": "^0.21.0",
+    "bestzip": "^2.1.7",
+    "dotenv": "^17.2.2",
+    "express": "^4.18.2",
     "node-telegram-bot-api": "^0.61.0",
     "openai": "^5.20.1",
-    "rcon-client": "^4.2.5",
-    "ssh2-sftp-client": "^8.1.0"
+    "rcon-client": "4.2.0",
+    "ssh2-sftp-client": "^9.1.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
