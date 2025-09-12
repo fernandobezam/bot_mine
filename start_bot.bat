@@ -6,6 +6,6 @@ cd /d "%~dp0"
 
 REM Rodar o bot
 echo 🚀 Iniciando MC Render Bot...
-node mc_render_bot_full.js
+node mc_render_bot.js
 
 pause

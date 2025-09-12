@@ -1,6 +1,5 @@
 /**
- * mc_render_bot.js - Versão completa 2025
- * Monitoramento, RCON, SFTP, backups, comandos Telegram, IA integrada
+ * mc_render_bot.js - Versão com DeepSeek + Groq
  */
 
 require("dotenv").config({ path: __dirname + "/.env" });
@@ -12,6 +11,7 @@ const { Rcon } = require("rcon-client");
 const http = require("http");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const OpenAI = require("openai");
+const Groq = require("groq-sdk");
 const os = require("os");
 const { exec } = require("child_process");
 const bestzip = require("bestzip");
@@ -34,6 +34,8 @@ const RCON_PORT = parseInt(process.env.RCON_PORT || "26255");
 const RCON_PASSWORD = process.env.RCON_PASSWORD;
 const GEMINI_KEYS = [process.env.GEMINI_API_KEY_1, process.env.GEMINI_API_KEY_2].filter(Boolean);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MEMORY_THRESHOLD = parseFloat(process.env.MEMORY_THRESHOLD || 0.8);
 const TPS_THRESHOLD = parseFloat(process.env.TPS_THRESHOLD || 18);
 const CRASH_COOLDOWN = parseInt(process.env.CRASH_COOLDOWN || 300000);
@@ -54,10 +56,11 @@ let serverStartTime = Date.now();
 let lastBackupTime = 0;
 let commandCooldowns = {};
 
-// === Gemini + OpenAI ===
+// === Gemini + OpenAI + Groq ===
 let geminiIndex = 0;
 let genAI = GEMINI_KEYS.length ? new GoogleGenerativeAI(GEMINI_KEYS[0]) : null;
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 
 // === Prompt fixo da IA ===
 const IA_SYSTEM_PROMPT = `
@@ -75,6 +78,67 @@ Funções:
 // === Função IA ===
 async function askAI(question) {
   let lastError = "";
+
+  // 1️⃣ DeepSeek
+  if (DEEPSEEK_API_KEY) {
+    try {
+      const res = await fetch("https://api.deepseek.com/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${DEEPSEEK_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "deepseek-chat",
+          messages: [
+            { role: "system", content: IA_SYSTEM_PROMPT },
+            { role: "user", content: question }
+          ],
+          max_tokens: 300
+        })
+      });
+      const data = await res.json();
+      if (data.choices?.[0]?.message?.content) return data.choices[0].message.content;
+    } catch (err) {
+      lastError = err.message;
+    }
+  }
+
+  // 2️⃣ Groq
+  if (groq) {
+    try {
+      const res = await groq.chat.completions.create({
+        model: "llama-3.1-70b-versatile",
+        messages: [
+          { role: "system", content: IA_SYSTEM_PROMPT },
+          { role: "user", content: question }
+        ],
+        max_tokens: 300
+      });
+      return res.choices[0].message.content;
+    } catch (err) {
+      lastError = err.message;
+    }
+  }
+
+  // 3️⃣ OpenAI
+  if (openai) {
+    try {
+      const res = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: IA_SYSTEM_PROMPT },
+          { role: "user", content: question }
+        ],
+        max_tokens: 300
+      });
+      return res.choices[0].message.content;
+    } catch (err) {
+      lastError = err.message;
+    }
+  }
+
+  // 4️⃣ Gemini
   for (let i = 0; i < GEMINI_KEYS.length; i++) {
     try {
       genAI = new GoogleGenerativeAI(GEMINI_KEYS[geminiIndex]);
@@ -87,23 +151,10 @@ async function askAI(question) {
       geminiIndex = (geminiIndex + 1) % GEMINI_KEYS.length;
     }
   }
-  if (openai) {
-    try {
-      const res = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: IA_SYSTEM_PROMPT },
-          { role: "user", content: question },
-        ],
-        max_tokens: 300,
-      });
-      return res.choices[0].message.content;
-    } catch (err) {
-      lastError = err.message;
-    }
-  }
+
   return `⚠ Nenhuma IA pôde responder: ${lastError}`;
 }
+
 
 // === Função Telegram ===
 function sendTelegram(msg) {

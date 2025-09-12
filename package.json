@@ -13,6 +13,7 @@
     "bestzip": "^2.1.7",
     "dotenv": "^17.2.2",
     "express": "^4.18.2",
+    "groq-sdk": "^0.32.0",
     "node-telegram-bot-api": "^0.61.0",
     "openai": "^5.20.1",
     "rcon-client": "4.2.0",
