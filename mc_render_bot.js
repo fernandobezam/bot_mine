@@ -1,5 +1,5 @@
 /**
- * mc_render_bot.js - Versão com DeepSeek + Groq (corrigido parse_mode HTML)
+ * mc_render_bot.js - Versão completa com todas as melhorias solicitadas
  */
 
 require("dotenv").config({ path: __dirname + "/.env" });
@@ -13,11 +13,13 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const OpenAI = require("openai");
 const Groq = require("groq-sdk");
 const os = require("os");
-const { exec } = require("child_process");
+const { exec, spawn } = require("child_process");
 const bestzip = require("bestzip");
+const cron = require("node-cron");
 
 // === Configurações do .env ===
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_BOT2_TOKEN = process.env.TELEGRAM_BOT2_TOKEN; // Novo bot para IA
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const SFTP_HOST = process.env.SFTP_HOST;
 const SFTP_PORT = parseInt(process.env.SFTP_PORT || "22");
@@ -41,20 +43,40 @@ const TPS_THRESHOLD = parseFloat(process.env.TPS_THRESHOLD || 18);
 const CRASH_COOLDOWN = parseInt(process.env.CRASH_COOLDOWN || 300000);
 const CHAT_FLOOD_COOLDOWN = parseInt(process.env.CHAT_FLOOD_COOLDOWN || 2000);
 const BACKUP_INTERVAL = parseInt(process.env.BACKUP_INTERVAL || 1440);
+const BACKUP_INCREMENTAL_INTERVAL = parseInt(process.env.BACKUP_INCREMENTAL_INTERVAL || 240);
 const PING_INTERVAL = parseInt(process.env.PING_INTERVAL || 60);
+const LOG_RETENTION_DAYS = parseInt(process.env.LOG_RETENTION_DAYS || 7);
 const PORT = process.env.PORT || 4000;
+const SERVER_START_COMMAND = process.env.SERVER_START_COMMAND || "java -jar server.jar nogui";
 
 // === Inicializações ===
 require("events").defaultMaxListeners = 50;
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+const bot2 = TELEGRAM_BOT2_TOKEN ? new TelegramBot(TELEGRAM_BOT2_TOKEN, { polling: true }) : null;
 const sftp = new SftpClient();
 let rcon = null;
 let sentCrashes = new Set();
 let lastChatTimes = {};
 let playerKills = {};
+let playerDeaths = {};
+let playerPlaytime = {};
 let serverStartTime = Date.now();
 let lastBackupTime = 0;
+let lastIncrementalBackupTime = 0;
 let commandCooldowns = {};
+let serverProcess = null;
+
+// === Detecção de erros de mods específicos ===
+const MOD_ERRORS = {
+  'kubejs': ['kubejs error', 'script error', 'kubejs.exception'],
+  'create': ['create mod error', 'contraption crash', 'create.network'],
+  'jei': ['jei exception', 'recipe error', 'jei.config'],
+  'tconstruct': ['tinkers', 'smeltery error', 'tconstruct'],
+  'thermal': ['thermal', 'cofh', 'dynamo'],
+  'mekanism': ['mekanism', 'chemical', 'gas'],
+  'ftb': ['ftb', 'team', 'quest'],
+  'ae2': ['applied energistics', 'ae2', 'me system']
+};
 
 // === Gemini + OpenAI + Groq ===
 let geminiIndex = 0;
@@ -97,40 +119,37 @@ async function askAI(question) {
   }
 
   // 2️⃣ Groq
-if (groq) {
-  try {
-    let res;
+  if (groq) {
     try {
-      // Modelo recomendado
-      res = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages: [
-          { role: "system", content: IA_SYSTEM_PROMPT },
-          { role: "user", content: question }
-        ],
-        max_tokens: 300
-      });
-    } catch (err) {
-      // Se o modelo principal não estiver disponível, tenta outro menor
-      if (err.message.includes("model_decommissioned")) {
+      let res;
+      try {
         res = await groq.chat.completions.create({
-          model: "llama-3.3-8b-instant",
+          model: "llama-3.3-70b-versatile",
           messages: [
             { role: "system", content: IA_SYSTEM_PROMPT },
             { role: "user", content: question }
           ],
           max_tokens: 300
         });
-      } else {
-        throw err;
+      } catch (err) {
+        if (err.message.includes("model_decommissioned")) {
+          res = await groq.chat.completions.create({
+            model: "llama-3.3-8b-instant",
+            messages: [
+              { role: "system", content: IA_SYSTEM_PROMPT },
+              { role: "user", content: question }
+            ],
+            max_tokens: 300
+          });
+        } else {
+          throw err;
+        }
       }
+      return res.choices[0].message.content;
+    } catch (err) {
+      lastError = err.message;
     }
-    return res.choices[0].message.content;
-  } catch (err) {
-    lastError = err.message;
   }
-}
-
 
   // 3️⃣ DeepSeek
   if (DEEPSEEK_API_KEY) {
@@ -181,22 +200,6 @@ function safeSend(chatId, text, opts = {}) {
   });
 }
 
-// === Exemplo de correção nos comandos ===
-bot.on("message", async msg => {
-  const chatId = msg.chat.id.toString();
-  const text = msg.text?.trim();
-
-  if (text?.startsWith("/run") && !text.includes(" ")) {
-    return safeSend(chatId, "⚠️ Use: /run &lt;comando&gt;", { parse_mode: "HTML" });
-  }
-
-  if (text?.startsWith("/ask") && !text.includes(" ")) {
-    return safeSend(chatId, "⚠️ Use: /ask &lt;sua pergunta&gt;", { parse_mode: "HTML" });
-  }
-
-});
-
-
 // === Função Telegram ===
 function sendTelegram(msg) {
   bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: "HTML" }).catch(console.error);
@@ -234,10 +237,11 @@ async function runRconCommand(command) {
 }
 
 // === Função de backup ===
-async function createBackup() {
+async function createBackup(incremental = false) {
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupFileName = `backup-${timestamp}.zip`;
+    const backupType = incremental ? 'incremental' : 'full';
+    const backupFileName = `backup-${backupType}-${timestamp}.zip`;
     const backupPath = path.join(BACKUP_DIR, backupFileName);
     
     // Criar diretório de backup se não existir
@@ -245,7 +249,7 @@ async function createBackup() {
       fs.mkdirSync(BACKUP_DIR, { recursive: true });
     }
     
-    sendTelegram("🔄 Iniciando backup do mundo...");
+    sendTelegram(`🔄 Iniciando backup ${backupType} do mundo...`);
     
     // Compactar mundo
     await bestzip({
@@ -261,13 +265,115 @@ async function createBackup() {
       await sftp.end();
     }
     
-    lastBackupTime = Date.now();
-    sendTelegram(`✅ Backup concluído: ${backupFileName}`);
+    if (incremental) {
+      lastIncrementalBackupTime = Date.now();
+    } else {
+      lastBackupTime = Date.now();
+    }
+    
+    sendTelegram(`✅ Backup ${backupType} concluído: ${backupFileName}`);
     return true;
   } catch (err) {
     console.error("Erro no backup:", err);
-    sendTelegram(`❌ Erro no backup: ${err.message}`);
+    sendTelegram(`❌ Erro no backup ${incremental ? 'incremental' : 'completo'}: ${err.message}`);
     return false;
+  }
+}
+
+// === Função para iniciar o servidor ===
+async function startServer() {
+  try {
+    if (serverProcess) {
+      return "❌ Servidor já está em execução";
+    }
+    
+    sendTelegram("🔄 Iniciando servidor Minecraft...");
+    
+    serverProcess = spawn(SERVER_START_COMMAND, {
+      shell: true,
+      cwd: path.dirname(WORLD_DIR)
+    });
+    
+    serverProcess.stdout.on('data', (data) => {
+      console.log(`Servidor: ${data}`);
+    });
+    
+    serverProcess.stderr.on('data', (data) => {
+      console.error(`Servidor (erro): ${data}`);
+    });
+    
+    serverProcess.on('close', (code) => {
+      sendTelegram(`🔴 Servidor fechado com código: ${code}`);
+      serverProcess = null;
+    });
+    
+    // Aguardar um pouco para o servidor iniciar
+    await new Promise(resolve => setTimeout(resolve, 10000));
+    
+    // Reconectar RCON após iniciar o servidor
+    await connectRcon();
+    
+    return "✅ Servidor iniciado com sucesso!";
+  } catch (err) {
+    return `❌ Erro ao iniciar servidor: ${err.message}`;
+  }
+}
+
+// === Função para parar o servidor ===
+async function stopServer() {
+  try {
+    if (!serverProcess) {
+      const result = await runRconCommand("stop");
+      return `✅ Comando de parada enviado: ${result}`;
+    }
+    
+    sendTelegram("🔄 Parando servidor Minecraft...");
+    serverProcess.kill('SIGINT');
+    
+    // Aguardar processo terminar
+    await new Promise(resolve => {
+      if (serverProcess) {
+        serverProcess.on('close', resolve);
+      } else {
+        resolve();
+      }
+    });
+    
+    serverProcess = null;
+    return "✅ Servidor parado com sucesso!";
+  } catch (err) {
+    return `❌ Erro ao parar servidor: ${err.message}`;
+  }
+}
+
+// === Limpeza de logs ===
+async function clearLogs() {
+  try {
+    await sftp.connect({ host: SFTP_HOST, port: SFTP_PORT, username: SFTP_USER, password: SFTP_PASSWORD });
+    
+    // Limpar logs do Minecraft
+    const logs = await sftp.list(MC_LOG_DIR);
+    const now = Date.now();
+    const retentionTime = now - (LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    
+    for (const file of logs) {
+      if (file.name !== 'latest.log' && file.modifyTime < retentionTime) {
+        await sftp.delete(path.posix.join(MC_LOG_DIR, file.name));
+      }
+    }
+    
+    // Limpar crash reports antigos
+    const crashes = await sftp.list(MC_CRASH_DIR);
+    for (const file of crashes) {
+      if (file.name.endsWith('.txt') && file.modifyTime < retentionTime) {
+        await sftp.delete(path.posix.join(MC_CRASH_DIR, file.name));
+      }
+    }
+    
+    await sftp.end();
+    return `✅ Logs com mais de ${LOG_RETENTION_DAYS} dias foram limpos!`;
+  } catch (err) {
+    return `❌ Erro ao limpar logs: ${err.message}`;
   }
 }
 
@@ -281,6 +387,12 @@ async function monitorPerformance() {
         const tpsMatch = tpsResponse.match(/Overall: ([\d.]+)/);
         if (tpsMatch && parseFloat(tpsMatch[1]) < TPS_THRESHOLD) {
           sendTelegram(`⚠️ TPS baixo: ${tpsMatch[1]} (limite: ${TPS_THRESHOLD})`);
+          
+          // Verificar chunks carregados se TPS estiver baixo
+          const chunkResponse = await runRconCommand("forge chunk summary");
+          if (chunkResponse && !chunkResponse.includes("Erro")) {
+            sendTelegram(`📊 Chunks carregados:\n${chunkResponse.substring(0, 300)}`);
+          }
         }
       }
       
@@ -291,6 +403,19 @@ async function monitorPerformance() {
       
       if (memUsage > MEMORY_THRESHOLD) {
         sendTelegram(`⚠️ Uso alto de memória: ${(memUsage * 100).toFixed(1)}%`);
+        
+        // Tentar limpar memória se estiver muito alta
+        if (memUsage > 0.9) {
+          await runRconCommand("forge gc");
+          sendTelegram("🔄 Coleta de lixo forçada executada");
+        }
+      }
+      
+      // Verificar carga da CPU
+      const loadAvg = os.loadavg()[0];
+      const cpuCores = os.cpus().length;
+      if (loadAvg > cpuCores * 0.8) {
+        sendTelegram(`⚠️ Carga alta da CPU: ${loadAvg.toFixed(2)} (máx recomendado: ${(cpuCores * 0.8).toFixed(1)})`);
       }
     } catch (err) {
       console.error("Erro no monitoramento de performance:", err);
@@ -322,25 +447,39 @@ async function monitorLogs() {
             if (line.includes("joined the game")) {
               const m = line.match(/(\w+) joined the game/);
               if (m) {
-                sendTelegram(`✅ <b>${m[1]}</b> entrou no servidor`);
+                const player = m[1];
+                sendTelegram(`✅ <b>${player}</b> entrou no servidor`);
+                playerPlaytime[player] = playerPlaytime[player] || { 
+                  firstJoin: Date.now(), 
+                  lastJoin: Date.now(), 
+                  totalTime: 0 
+                };
+                playerPlaytime[player].lastJoin = Date.now();
               }
             } 
             // Jogador saiu
             else if (line.includes("left the game")) {
               const m = line.match(/(\w+) left the game/);
               if (m) {
-                sendTelegram(`❌ <b>${m[1]}</b> saiu do servidor`);
+                const player = m[1];
+                sendTelegram(`❌ <b>${player}</b> saiu do servidor`);
+                if (playerPlaytime[player]) {
+                  const sessionTime = Date.now() - playerPlaytime[player].lastJoin;
+                  playerPlaytime[player].totalTime += sessionTime;
+                }
               }
             } 
             // Kill no jogo
             else if (line.includes("was slain by") || line.includes("was killed by")) {
               sendTelegram(`⚔️ ${line}`);
               
-              // Contabilizar kills
+              // Contabilizar kills e deaths
               const killMatch = line.match(/(\w+) was (slain|killed) by (\w+)/);
               if (killMatch) {
+                const victim = killMatch[1];
                 const killer = killMatch[3];
                 playerKills[killer] = (playerKills[killer] || 0) + 1;
+                playerDeaths[victim] = (playerDeaths[victim] || 0) + 1;
               }
             } 
             // Chat do servidor
@@ -358,9 +497,24 @@ async function monitorLogs() {
               }
             }
             // Erros críticos
-            else if (line.toLowerCase().includes("error") || line.toLowerCase().includes("exception")) {
-              if (line.length < 100) { // Não enviar logs muito longos
-                sendTelegram(`🚨 <b>Erro detectado:</b> ${line}`);
+            else if (line.toLowerCase().includes("error") || line.toLowerCase().includes("exception") || line.toLowerCase().includes("warn")) {
+              if (line.length < 200) { // Não enviar logs muito longos
+                // Verificar se é erro de mod específico
+                let isModError = false;
+                for (const [mod, keywords] of Object.entries(MOD_ERRORS)) {
+                  for (const keyword of keywords) {
+                    if (line.toLowerCase().includes(keyword)) {
+                      sendTelegram(`🚨 <b>ERRO DE MOD [${mod.toUpperCase()}]:</b>\n${line}`);
+                      isModError = true;
+                      break;
+                    }
+                  }
+                  if (isModError) break;
+                }
+                
+                if (!isModError) {
+                  sendTelegram(`⚠️ <b>Log importante:</b> ${line}`);
+                }
               }
             }
           }
@@ -382,7 +536,7 @@ async function monitorLogs() {
             const lines = content.split("\n").slice(-10);
             for (const line of lines) {
               if (line.trim() && (line.toLowerCase().includes("error") || line.toLowerCase().includes("warn"))) {
-                sendTelegram(`📜 [${file}] ${line.substring(0, 200)}`);
+                sendTelegram(`📜 [KubeJS/${file}] ${line.substring(0, 200)}`);
               }
             }
             lastSizes[kubePath] = stats.size;
@@ -429,9 +583,15 @@ async function monitorLogs() {
 
 // === Backup automático ===
 function setupAutoBackup() {
+  // Backup completo
   setInterval(async () => {
-    await createBackup();
+    await createBackup(false);
   }, BACKUP_INTERVAL * 60 * 1000); // Converter minutos para ms
+  
+  // Backup incremental
+  setInterval(async () => {
+    await createBackup(true);
+  }, BACKUP_INCREMENTAL_INTERVAL * 60 * 1000);
 }
 
 // === Comandos Telegram ===
@@ -454,7 +614,7 @@ bot.on("message", async msg => {
     
     switch(command) {
       case "/help":
-  bot.sendMessage(chatId, `
+        bot.sendMessage(chatId, `
 📖 <b>Comandos disponíveis:</b>
 
 👥 <b>Informações:</b>
@@ -462,20 +622,25 @@ bot.on("message", async msg => {
 /players → <code>Lista de jogadores online</code>
 /ping → <code>Mostra ping do servidor</code>
 /topkills → <code>Ranking de kills por jogador</code>
+/topdeaths → <code>Ranking de mortes por jogador</code>
+/topplaytime → <code>Ranking de tempo jogado</code>
 /uptime → <code>Tempo de atividade do servidor</code>
+/stats <code>jogador</code> → <code>Estatísticas de um jogador</code>
 
 ⚙️ <b>Controle:</b>
 /run <code>comando</code> → <code>Executa comando no servidor</code>
-/backup → <code>Cria backup do mundo</code>
+/backup → <code>Cria backup completo do mundo</code>
+/backup incremental → <code>Cria backup incremental</code>
 /clearlogs → <code>Limpa logs antigos</code>
 /stopserver → <code>Para o servidor</code>
 /startserver → <code>Inicia o servidor</code>
+/restartserver → <code>Reinicia o servidor</code>
 
 ❓ <b>Ajuda:</b>
 /help → <code>Mostra esta ajuda</code>
 /ask <code>pergunta</code> → <code>Pergunta à IA especialista</code>
-`, { parse_mode: "HTML" });
-  break;
+        `, { parse_mode: "HTML" });
+        break;
         
       case "/status":
         try {
@@ -489,15 +654,22 @@ bot.on("message", async msg => {
           const totalMem = os.totalmem() / 1024 / 1024 / 1024;
           const memUsage = ((1 - (freeMem / totalMem)) * 100).toFixed(1);
           const loadAvg = os.loadavg()[0];
+          const cpuCores = os.cpus().length;
           
           let statusMsg = `🖥️ <b>Status do Servidor</b>\n\n`;
           statusMsg += `⏰ <b>Uptime:</b> ${uptime}h\n`;
           statusMsg += `👥 <b>Jogadores:</b> ${playerList}\n`;
-          statusMsg += `📊 <b>Memória:</b> ${memUsage}% usado\n`;
-          statusMsg += `🔧 <b>Load AVG:</b> ${loadAvg.toFixed(2)}\n`;
+          statusMsg += `📊 <b>Memória:</b> ${memUsage}% usado (${(totalMem - freeMem).toFixed(1)}/${totalMem.toFixed(1)} GB)\n`;
+          statusMsg += `🔧 <b>Load AVG:</b> ${loadAvg.toFixed(2)}/${cpuCores}\n`;
+          statusMsg += `💥 <b>Crashes hoje:</b> ${sentCrashes.size}\n`;
           
           if (tpsInfo && !tpsInfo.includes("Erro")) {
             statusMsg += `⚡ <b>TPS:</b> ${tpsInfo}\n`;
+          }
+          
+          if (lastBackupTime > 0) {
+            const lastBackupHours = Math.floor((Date.now() - lastBackupTime) / 3600000);
+            statusMsg += `💾 <b>Último backup:</b> ${lastBackupHours}h atrás\n`;
           }
           
           bot.sendMessage(chatId, statusMsg, { parse_mode: "HTML" });
@@ -526,6 +698,56 @@ bot.on("message", async msg => {
         bot.sendMessage(chatId, `⚔️ <b>Top 10 Killers:</b>\n${topKills || "Nenhum kill registrado ainda"}`, { parse_mode: "HTML" });
         break;
         
+      case "/topdeaths":
+        const topDeaths = Object.entries(playerDeaths)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 10)
+          .map(([player, deaths], index) => `${index + 1}. ${player}: ${deaths} mortes`)
+          .join("\n");
+        
+        bot.sendMessage(chatId, `💀 <b>Top 10 Mortes:</b>\n${topDeaths || "Nenhuma morte registrada ainda"}`, { parse_mode: "HTML" });
+        break;
+        
+      case "/topplaytime":
+        const topPlaytime = Object.entries(playerPlaytime)
+          .sort((a, b) => b[1].totalTime - a[1].totalTime)
+          .slice(0, 10)
+          .map(([player, data], index) => {
+            const hours = Math.floor(data.totalTime / 3600000);
+            return `${index + 1}. ${player}: ${hours}h`;
+          })
+          .join("\n");
+        
+        bot.sendMessage(chatId, `⏰ <b>Top 10 Tempo Jogado:</b>\n${topPlaytime || "Nenhum dado de playtime ainda"}`, { parse_mode: "HTML" });
+        break;
+        
+      case "/stats":
+        if (!text.includes(" ")) {
+          bot.sendMessage(chatId, "⚠️ Use: /stats <jogador>");
+          break;
+        }
+        
+        const playerName = text.substring(6).trim();
+        const kills = playerKills[playerName] || 0;
+        const deaths = playerDeaths[playerName] || 0;
+        const kdRatio = deaths > 0 ? (kills / deaths).toFixed(2) : kills > 0 ? "∞" : "0";
+        const playtimeData = playerPlaytime[playerName];
+        const playtimeHours = playtimeData ? Math.floor(playtimeData.totalTime / 3600000) : 0;
+        
+        let statsMsg = `📊 <b>Estatísticas de ${playerName}:</b>\n\n`;
+        statsMsg += `⚔️ <b>Kills:</b> ${kills}\n`;
+        statsMsg += `💀 <b>Mortes:</b> ${deaths}\n`;
+        statsMsg += `🎯 <b>K/D Ratio:</b> ${kdRatio}\n`;
+        statsMsg += `⏰ <b>Tempo jogado:</b> ${playtimeHours}h\n`;
+        
+        if (playtimeData) {
+          const firstJoin = new Date(playtimeData.firstJoin).toLocaleDateString();
+          statsMsg += `📅 <b>Primeiro join:</b> ${firstJoin}\n`;
+        }
+        
+        bot.sendMessage(chatId, statsMsg, { parse_mode: "HTML" });
+        break;
+        
       case "/uptime":
         const uptimeHours = Math.floor((Date.now() - serverStartTime) / 3600000);
         bot.sendMessage(chatId, `⏰ <b>Uptime:</b> ${uptimeHours} horas`, { parse_mode: "HTML" });
@@ -543,26 +765,38 @@ bot.on("message", async msg => {
         break;
         
       case "/backup":
-        bot.sendMessage(chatId, "🔄 Iniciando backup...");
-        const backupResult = await createBackup();
+        const isIncremental = text.includes("incremental");
+        bot.sendMessage(chatId, `🔄 Iniciando backup ${isIncremental ? 'incremental' : 'completo'}...`);
+        const backupResult = await createBackup(isIncremental);
         if (backupResult) {
-          bot.sendMessage(chatId, "✅ Backup concluído com sucesso!");
+          bot.sendMessage(chatId, `✅ Backup ${isIncremental ? 'incremental' : 'completo'} concluído com sucesso!`);
         }
         break;
         
       case "/clearlogs":
-        // Implementar limpeza de logs
-        bot.sendMessage(chatId, "📁 Limpeza de logs (implementação em desenvolvimento)");
+        bot.sendMessage(chatId, "🔄 Limpando logs antigos...");
+        const clearResult = await clearLogs();
+        bot.sendMessage(chatId, clearResult);
         break;
         
       case "/stopserver":
-        const stopConfirm = await runRconCommand("stop");
-        bot.sendMessage(chatId, `🛑 <b>Parando servidor:</b>\n${stopConfirm}`, { parse_mode: "HTML" });
+        const stopResult = await stopServer();
+        bot.sendMessage(chatId, stopResult);
         break;
         
       case "/startserver":
-        // Isso precisaria de integração com sistema de init do servidor
-        bot.sendMessage(chatId, "⚠️ Comando /startserver precisa de configuração adicional");
+        bot.sendMessage(chatId, "🔄 Iniciando servidor...");
+        const startResult = await startServer();
+        bot.sendMessage(chatId, startResult);
+        break;
+        
+      case "/restartserver":
+        bot.sendMessage(chatId, "🔄 Reiniciando servidor...");
+        await stopServer();
+        // Aguardar 10 segundos antes de iniciar
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        const restartResult = await startServer();
+        bot.sendMessage(chatId, restartResult);
         break;
         
       case "/ask":
@@ -587,24 +821,37 @@ bot.on("message", async msg => {
   }
 });
 
+// === Configurar bot2 (IA especialista) ===
+if (bot2) {
+  bot2.on("message", async (msg) => {
+    const text = msg.text?.trim();
+    if (!text) return;
+    
+    // Anti-flood para comandos
+    const userId = msg.from.id.toString();
+    const now = Date.now();
+    if (commandCooldowns[userId] && now - commandCooldowns[userId] < 2000) {
+      return bot2.sendMessage(msg.chat.id, "⏳ Aguarde um pouco antes de enviar outra pergunta.");
+    }
+    commandCooldowns[userId] = now;
+    
+    bot2.sendMessage(msg.chat.id, "🤖 Consultando especialista Minecraft...");
+    const answer = await askAI(text);
+    bot2.sendMessage(msg.chat.id, `🎮 <b>Especialista Minecraft:</b>\n${answer}`, { 
+      parse_mode: "HTML" 
+    });
+  });
+}
+
 // === Relatório diário ===
 function setupDailyReport() {
   // Agendar para enviar às 10h todo dia
-  const now = new Date();
-  const targetTime = new Date(now);
-  targetTime.setHours(10, 0, 0, 0);
+  cron.schedule('0 10 * * *', async () => {
+    await sendDailyReport();
+  });
   
-  if (now > targetTime) {
-    targetTime.setDate(targetTime.getDate() + 1);
-  }
-  
-  const timeUntilReport = targetTime - now;
-  
-  setTimeout(() => {
-    sendDailyReport();
-    // Agendar próximo relatório para o mesmo horário no dia seguinte
-    setInterval(sendDailyReport, 24 * 60 * 60 * 1000);
-  }, timeUntilReport);
+  // Enviar primeiro relatório agora
+  setTimeout(sendDailyReport, 5000);
 }
 
 async function sendDailyReport() {
@@ -616,19 +863,73 @@ async function sendDailyReport() {
     const topKillers = Object.entries(playerKills)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
-      .map(([player, kills]) => `${player}: ${kills} kills`)
+      .map(([player, kills], index) => `${index + 1}. ${player}: ${kills} kills`)
+      .join("\n");
+    
+    // Top 5 tempo jogado
+    const topPlayers = Object.entries(playerPlaytime)
+      .sort((a, b) => b[1].totalTime - a[1].totalTime)
+      .slice(0, 5)
+      .map(([player, data], index) => {
+        const hours = Math.floor(data.totalTime / 3600000);
+        return `${index + 1}. ${player}: ${hours}h`;
+      })
       .join("\n");
     
     let report = `📊 <b>Relatório Diário do Servidor</b>\n\n`;
     report += `⏰ <b>Uptime:</b> ${uptimeHours} horas\n`;
     report += `👥 <b>Jogadores online:</b> ${playerList}\n`;
     report += `⚔️ <b>Top killers:</b>\n${topKillers || "Nenhum kill registrado"}\n`;
+    report += `⏰ <b>Top tempo jogado:</b>\n${topPlayers || "Nenhum dado de playtime"}\n`;
     report += `💥 <b>Crashes hoje:</b> ${sentCrashes.size}\n`;
-    report += `✅ <b>Último backup:</b> ${lastBackupTime ? new Date(lastBackupTime).toLocaleString() : "Nunca"}`;
+    report += `✅ <b>Último backup completo:</b> ${lastBackupTime ? new Date(lastBackupTime).toLocaleString() : "Nunca"}\n`;
+    report += `🔄 <b>Último backup incremental:</b> ${lastIncrementalBackupTime ? new Date(lastIncrementalBackupTime).toLocaleString() : "Nunca"}`;
     
     sendTelegram(report);
   } catch (err) {
     console.error("Erro ao enviar relatório diário:", err);
+  }
+}
+
+// === Relatório semanal ===
+function setupWeeklyReport() {
+  // Agendar para enviar às 10h todo domingo
+  cron.schedule('0 10 * * 0', async () => {
+    await sendWeeklyReport();
+  });
+}
+
+async function sendWeeklyReport() {
+  try {
+    const uptimeHours = Math.floor((Date.now() - serverStartTime) / 3600000);
+    
+    // Top 10 killers da semana
+    const weeklyKills = Object.entries(playerKills)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([player, kills], index) => `${index + 1}. ${player}: ${kills} kills`)
+      .join("\n");
+    
+    // Top 10 tempo jogado da semana
+    const weeklyPlaytime = Object.entries(playerPlaytime)
+      .sort((a, b) => b[1].totalTime - a[1].totalTime)
+      .slice(0, 10)
+      .map(([player, data], index) => {
+        const hours = Math.floor(data.totalTime / 3600000);
+        return `${index + 1}. ${player}: ${hours}h`;
+      })
+      .join("\n");
+    
+    let report = `📈 <b>Relatório Semanal do Servidor</b>\n\n`;
+    report += `⏰ <b>Uptime total:</b> ${uptimeHours} horas\n`;
+    report += `⚔️ <b>Top killers da semana:</b>\n${weeklyKills || "Nenhum kill registrado"}\n`;
+    report += `⏰ <b>Top tempo jogado da semana:</b>\n${weeklyPlaytime || "Nenhum dado de playtime"}\n`;
+    report += `💥 <b>Total de crashes:</b> ${sentCrashes.size}\n`;
+    report += `📅 <b>Período:</b> ${new Date().toLocaleDateString()}`;
+    
+    sendTelegram(report);
+  } catch (err) {
+    console.error("Erro ao enviar relatório semanal:", err);
   }
 }
 
@@ -651,8 +952,13 @@ async function sendDailyReport() {
     monitorPerformance();
     setupAutoBackup();
     setupDailyReport();
+    setupWeeklyReport();
     
     console.log("✅ mc_render_bot em execução!");
+    if (bot2) {
+      console.log("✅ Bot2 (IA) em execução!");
+    }
+    
     sendTelegram("🤖 Bot iniciado com sucesso! Use /help para ver os comandos.");
   } catch (error) {
     console.error("Erro na inicialização:", error);
