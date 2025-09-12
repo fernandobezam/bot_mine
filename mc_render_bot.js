@@ -1,5 +1,5 @@
 /**
- * mc_render_bot.js - Versão com DeepSeek + Groq
+ * mc_render_bot.js - Versão com DeepSeek + Groq (corrigido parse_mode HTML)
  */
 
 require("dotenv").config({ path: __dirname + "/.env" });
@@ -154,6 +154,28 @@ async function askAI(question) {
 
   return `⚠ Nenhuma IA pôde responder: ${lastError}`;
 }
+
+// === Função segura para enviar mensagens ===
+function safeSend(chatId, text, opts = {}) {
+  bot.sendMessage(chatId, text, opts).catch(err => {
+    console.error("Erro Telegram:", err.message);
+  });
+}
+
+// === Exemplo de correção nos comandos ===
+bot.on("message", async msg => {
+  const chatId = msg.chat.id.toString();
+  const text = msg.text?.trim();
+
+  if (text?.startsWith("/run") && !text.includes(" ")) {
+    return safeSend(chatId, "⚠️ Use: /run &lt;comando&gt;", { parse_mode: "HTML" });
+  }
+
+  if (text?.startsWith("/ask") && !text.includes(" ")) {
+    return safeSend(chatId, "⚠️ Use: /ask &lt;sua pergunta&gt;", { parse_mode: "HTML" });
+  }
+
+});
 
 
 // === Função Telegram ===
@@ -413,26 +435,28 @@ bot.on("message", async msg => {
     
     switch(command) {
       case "/help":
-        bot.sendMessage(chatId, `📖 <b>Comandos disponíveis:</b>
-        
+  bot.sendMessage(chatId, `
+📖 <b>Comandos disponíveis:</b>
+
 👥 <b>Informações:</b>
-/status → Status do servidor (memória, TPS, jogadores)
-/players → Lista de jogadores online
-/ping → Mostra ping do servidor
-/topkills → Ranking de kills por jogador
-/uptime → Tempo de atividade do servidor
+/status → <code>Status do servidor (memória, TPS, jogadores)</code>
+/players → <code>Lista de jogadores online</code>
+/ping → <code>Mostra ping do servidor</code>
+/topkills → <code>Ranking de kills por jogador</code>
+/uptime → <code>Tempo de atividade do servidor</code>
 
 ⚙️ <b>Controle:</b>
-/run <comando> → Executa comando no servidor
-/backup → Cria backup do mundo
-/clearlogs → Limpa logs antigos
-/stopserver → Para o servidor
-/startserver → Inicia o servidor
+/run <code>comando</code> → <code>Executa comando no servidor</code>
+/backup → <code>Cria backup do mundo</code>
+/clearlogs → <code>Limpa logs antigos</code>
+/stopserver → <code>Para o servidor</code>
+/startserver → <code>Inicia o servidor</code>
 
 ❓ <b>Ajuda:</b>
-/help → Mostra esta ajuda
-/ask <pergunta> → Pergunta à IA especialista`, { parse_mode: "HTML" });
-        break;
+/help → <code>Mostra esta ajuda</code>
+/ask <code>pergunta</code> → <code>Pergunta à IA especialista</code>
+`, { parse_mode: "HTML" });
+  break;
         
       case "/status":
         try {
