@@ -97,21 +97,40 @@ async function askAI(question) {
   }
 
   // 2️⃣ Groq
-  if (groq) {
+if (groq) {
+  try {
+    let res;
     try {
-      const res = await groq.chat.completions.create({
-        model: "llama-3.1-70b-versatile",
+      // Modelo recomendado
+      res = await groq.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
         messages: [
           { role: "system", content: IA_SYSTEM_PROMPT },
           { role: "user", content: question }
         ],
         max_tokens: 300
       });
-      return res.choices[0].message.content;
     } catch (err) {
-      if (!err.message.includes("429")) lastError = err.message;
+      // Se o modelo principal não estiver disponível, tenta outro menor
+      if (err.message.includes("model_decommissioned")) {
+        res = await groq.chat.completions.create({
+          model: "llama-3.3-8b-instant",
+          messages: [
+            { role: "system", content: IA_SYSTEM_PROMPT },
+            { role: "user", content: question }
+          ],
+          max_tokens: 300
+        });
+      } else {
+        throw err;
+      }
     }
+    return res.choices[0].message.content;
+  } catch (err) {
+    lastError = err.message;
   }
+}
+
 
   // 3️⃣ DeepSeek
   if (DEEPSEEK_API_KEY) {
