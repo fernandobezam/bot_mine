@@ -79,7 +79,41 @@ Funções:
 async function askAI(question) {
   let lastError = "";
 
-  // 1️⃣ DeepSeek
+  // 1️⃣ OpenAI
+  if (openai) {
+    try {
+      const res = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: IA_SYSTEM_PROMPT },
+          { role: "user", content: question }
+        ],
+        max_tokens: 300
+      });
+      return res.choices[0].message.content;
+    } catch (err) {
+      if (!err.message.includes("429")) lastError = err.message;
+    }
+  }
+
+  // 2️⃣ Groq
+  if (groq) {
+    try {
+      const res = await groq.chat.completions.create({
+        model: "llama-3.1-70b-versatile",
+        messages: [
+          { role: "system", content: IA_SYSTEM_PROMPT },
+          { role: "user", content: question }
+        ],
+        max_tokens: 300
+      });
+      return res.choices[0].message.content;
+    } catch (err) {
+      if (!err.message.includes("429")) lastError = err.message;
+    }
+  }
+
+  // 3️⃣ DeepSeek
   if (DEEPSEEK_API_KEY) {
     try {
       const res = await fetch("https://api.deepseek.com/chat/completions", {
@@ -100,41 +134,7 @@ async function askAI(question) {
       const data = await res.json();
       if (data.choices?.[0]?.message?.content) return data.choices[0].message.content;
     } catch (err) {
-      lastError = err.message;
-    }
-  }
-
-  // 2️⃣ Groq
-  if (groq) {
-    try {
-      const res = await groq.chat.completions.create({
-        model: "llama-3.1-70b-versatile",
-        messages: [
-          { role: "system", content: IA_SYSTEM_PROMPT },
-          { role: "user", content: question }
-        ],
-        max_tokens: 300
-      });
-      return res.choices[0].message.content;
-    } catch (err) {
-      lastError = err.message;
-    }
-  }
-
-  // 3️⃣ OpenAI
-  if (openai) {
-    try {
-      const res = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: IA_SYSTEM_PROMPT },
-          { role: "user", content: question }
-        ],
-        max_tokens: 300
-      });
-      return res.choices[0].message.content;
-    } catch (err) {
-      lastError = err.message;
+      if (!err.message.includes("429")) lastError = err.message;
     }
   }
 
@@ -147,7 +147,7 @@ async function askAI(question) {
       geminiIndex = (geminiIndex + 1) % GEMINI_KEYS.length;
       return result.response.text();
     } catch (err) {
-      lastError = err.message;
+      if (!err.message.includes("429")) lastError = err.message;
       geminiIndex = (geminiIndex + 1) % GEMINI_KEYS.length;
     }
   }
