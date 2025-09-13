@@ -334,10 +334,18 @@ async function runRconCommand(command) {
   }
 }
 
-// === Função de backup ===
+// === Função de backup (otimizada para Render) ===
 async function createBackup(incremental = false) {
   try {
     if (!WORLD_DIR) throw new Error("WORLD_DIR não configurado no .env");
+    
+    // No Render, apenas notificar - backup real precisa ser via SFTP
+    if (process.env.RENDER) {
+      const timestamp = new Date().toLocaleString('pt-BR');
+      sendTelegram(`🔄 Backup ${incremental ? 'incremental' : 'completo'} solicitado em ${timestamp} (Render Free - backup via SFTP manual)`);
+      return true;
+    }
+
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const backupType = incremental ? "incremental" : "full";
     const backupFileName = `backup-${backupType}-${timestamp}.zip`;
@@ -1161,8 +1169,16 @@ http.createServer((req, res) => {
 // === Inicialização principal ===
 (async () => {
   try {
-    if (!fs.existsSync(BOT_LOG_DIR)) fs.mkdirSync(BOT_LOG_DIR, { recursive: true });
-    if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    // Criar diretórios locais (usando caminhos relativos)
+    if (!fs.existsSync(BOT_LOG_DIR)) {
+      fs.mkdirSync(BOT_LOG_DIR, { recursive: true });
+      console.log(`✅ Diretório de logs criado: ${BOT_LOG_DIR}`);
+    }
+    
+    if (!fs.existsSync(BACKUP_DIR)) {
+      fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      console.log(`✅ Diretório de backups criado: ${BACKUP_DIR}`);
+    }
 
     // tentativa de conectar rcon se configurado
     await connectRcon();
