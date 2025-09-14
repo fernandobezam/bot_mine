@@ -1,7 +1,7 @@
 /**
- * mc_render_bot.js - v2.1 FINAL E COMPLETO
- * Bot completo para gerenciamento e monitoramento em tempo real de servidor Minecraft.
- * INCLUI: Monitoramento de jogadores, espelho de chat, detecção de travamento/crash e comando /ping.
+ * mc_render_bot.js - v3.0 FINAL COM MEMÓRIA
+ * Bot completo para gerenciamento de servidor Minecraft com memória de conversa.
+ * NOVOS RECURSOS: Histórico de conversa, respostas contextuais e comando /clear.
  */
 
 // ==============================
@@ -60,6 +60,7 @@ let geminiIndex = 0;
 let sentCrashes = new Set();
 let rconConsecutiveFails = 0;
 let isServerConsideredDown = false;
+const conversationHistories = {}; // <<<< NOVA MEMÓRIA DO BOT
 
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
@@ -122,20 +123,27 @@ async function sendLongMessage(chatId, text, options = { parse_mode: "HTML", dis
 }
 
 // ==============================
-//  Funções de Inteligência Artificial
+//  Funções de Inteligência Artificial (COM MEMÓRIA)
 // ==============================
-const IA_SYSTEM_PROMPT = `Você é um especialista em Minecraft e no modpack Integrated MC. Seja direto, técnico e amigável.`;
+const IA_SYSTEM_PROMPT = `Você é um especialista em Minecraft e no modpack Integrated MC. Mantenha o contexto da conversa para responder a perguntas de acompanhamento. Seja direto, técnico e amigável.`;
 
-async function askAI(question) {
+async function askAI(history) { // <<<< AGORA RECEBE O HISTÓRICO
     const providers = [
-        { name: "OpenAI", fn: () => openai?.chat.completions.create({ model: "gpt-4o-mini", messages: [{ role: "system", content: IA_SYSTEM_PROMPT }, { role: "user", content: question }] }) },
-        { name: "Groq", fn: () => groq?.chat.completions.create({ model: "llama-3.1-70b-versatile", messages: [{ role: "system", content: IA_SYSTEM_PROMPT }, { role: "user", content: question }] }) },
+        { name: "OpenAI", fn: () => openai?.chat.completions.create({ model: "gpt-4o-mini", messages: [{ role: "system", content: IA_SYSTEM_PROMPT }, ...history] }) },
+        { name: "Groq", fn: () => groq?.chat.completions.create({ model: "llama-3.1-70b-versatile", messages: [{ role: "system", content: IA_SYSTEM_PROMPT }, ...history] }) },
         { name: "Gemini", fn: async () => {
             if (!GEMINI_KEYS.length) return null;
             genAI = new GoogleGenerativeAI(GEMINI_KEYS[geminiIndex]);
             geminiIndex = (geminiIndex + 1) % GEMINI_KEYS.length;
             const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-            const result = await model.generateContent(question);
+            const chat = model.startChat({ 
+                history: history.slice(0, -1).map(msg => ({ // Envia o histórico, exceto a última pergunta
+                    role: msg.role === 'assistant' ? 'model' : 'user', 
+                    parts: [{ text: msg.content }] 
+                }))
+            });
+            const lastUserMessage = history[history.length - 1].content;
+            const result = await chat.sendMessage(lastUserMessage);
             return result.response;
         }}
     ];
@@ -362,7 +370,7 @@ async function monitorServerHealth() {
 }
 
 // ==============================
-//  Manipuladores de Comandos do Telegram
+//  Manipuladores de Comandos do Telegram (COM MEMÓRIA)
 // ==============================
 const commandHandlers = {
     '/help': (chatId) => sendLongMessage(chatId,
@@ -373,8 +381,13 @@ const commandHandlers = {
         `▶️  /backup - Iniciar um backup completo\n` +
         `▶️  /restartserver - Reiniciar o servidor\n\n` +
         `🧠  /ask &lt;pergunta&gt; - Falar com a IA\n` +
-        `🎨  /image &lt;descrição&gt; - Gerar uma imagem`
+        `🎨  /image &lt;descrição&gt; - Gerar uma imagem\n` +
+        `🔄  /clear - Limpar o histórico da conversa`
     ),
+    '/clear': (chatId) => {
+        conversationHistories[chatId] = []; // Limpa a memória para este chat
+        return sendLongMessage(chatId, "✅ O histórico da conversa foi limpo. Podemos começar de novo!");
+    },
     '/status': async (chatId) => {
         const players = await runRconCommand("list");
         const tps = await runRconCommand("forge tps");
@@ -404,7 +417,13 @@ const commandHandlers = {
     },
     '/ask': async (chatId, args) => {
         if (!args) return sendLongMessage(chatId, "Por favor, digite sua pergunta após o comando. Ex: `/ask Como fazer uma fornalha?`");
-        const answer = await askAI(args);
+        
+        const history = conversationHistories[chatId] || [];
+        history.push({ role: 'user', content: args });
+
+        const answer = await askAI(history);
+        history.push({ role: 'assistant', content: answer });
+
         await sendLongMessage(chatId, `🤖 <b>IA:</b>\n${escapeHtml(answer)}`);
     },
     '/image': async (chatId, args) => {
@@ -421,7 +440,7 @@ const commandHandlers = {
 };
 
 // ==============================
-//  Lógica Principal do Bot
+//  Lógica Principal do Bot (COM MEMÓRIA)
 // ==============================
 if (bot) {
     bot.on('message', async (msg) => {
@@ -430,15 +449,31 @@ if (bot) {
 
         if (TELEGRAM_CHAT_ID && chatId !== TELEGRAM_CHAT_ID) return;
 
+        // Inicializa o histórico se for a primeira mensagem daquele chat
+        if (!conversationHistories[chatId]) {
+            conversationHistories[chatId] = [];
+        }
+
         const [command, ...args] = text.trim().split(" ");
         const handler = commandHandlers[command.toLowerCase()];
 
         try {
             if (handler) {
+                // Se for um comando, executa o manipulador correspondente
                 await handler(chatId, args.join(" "));
             } else if (!text.startsWith('/')) {
-                // Se não for um comando, trata como uma pergunta para a IA
-                const answer = await askAI(text);
+                // Se não for um comando, trata como parte da conversa com a IA
+                const history = conversationHistories[chatId];
+                history.push({ role: 'user', content: text });
+
+                // Limita o histórico para as últimas 5 trocas (10 mensagens no total)
+                while (history.length > 10) {
+                    history.shift(); 
+                }
+                
+                const answer = await askAI(history);
+                history.push({ role: 'assistant', content: answer }); // Adiciona a resposta da IA ao histórico
+
                 await sendLongMessage(chatId, `🤖 <b>IA:</b>\n${escapeHtml(answer)}`);
             }
         } catch (err) {
@@ -484,5 +519,5 @@ http.createServer((req, res) => {
     monitorLogs();
     monitorServerHealth();
     console.log("✅ Bot iniciado com sucesso e monitorando o servidor!");
-    await sendTelegram(TELEGRAM_CHAT_ID, "🚀 **Bot reiniciado e online!**\nMonitoramento em tempo real ativado.", {disable_notification: false});
+    await sendTelegram(TELEGRAM_CHAT_ID, "🚀 **Bot reiniciado e online!**\nAgora com memória de conversa.", {disable_notification: false});
 })();
