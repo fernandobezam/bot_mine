@@ -7,15 +7,16 @@
     "start": "node mc_render_bot.js"
   },
   "dependencies": {
-    "ssh2-sftp-client": "^9.0.4",
-    "node-telegram-bot-api": "^0.66.0",
-    "rcon-client": "^4.2.3",
     "@google/generative-ai": "^0.21.0",
-    "openai": "^4.28.0",
-    "groq-sdk": "^0.5.0",
     "bestzip": "^2.2.1",
+    "dotenv": "^16.4.5",
+    "groq-sdk": "^0.5.0",
     "node-cron": "^3.0.3",
-    "dotenv": "^16.4.5"
+    "node-fetch": "^3.3.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^4.104.0",
+    "rcon-client": "^4.2.5",
+    "ssh2-sftp-client": "^9.1.0"
   },
   "engines": {
     "node": ">=18.0.0"
